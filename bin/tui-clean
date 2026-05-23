@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+tui-clean: Strip TUI rendering artifacts from clipboard or stdin.
+
+Problems fixed:
+  1. ANSI / VT escape sequences
+  2. OSC 8 hyperlinks       — URI from params replaces (possibly wrapped) display text
+  3. Box/panel padding      — most-common non-zero indent stripped from lines that have it
+  4. Soft-wrapped lines     — rejoined using terminal-width heuristic
+  5. Mid-URL line breaks    — URL fragments rejoined regardless of line length
+
+Usage:
+  tui-clean               read clipboard, clean, write back to clipboard
+  tui-clean --print       read clipboard, print cleaned text to stdout
+  tui-clean -             read stdin, write to stdout  (pipeline mode)
+  pbpaste | tui-clean -   same
+  tui-clean --width 120   explicit terminal width for wrap detection
+"""
+from __future__ import annotations  # list[str] on Python 3.8/3.9
+
+import re, sys, subprocess, argparse
+from collections import Counter
+
+
+# ── OSC 8 hyperlink extraction ────────────────────────────────────────────────
+# OSC 8 format: \x1b]8;params;URI\x07 display_text \x1b]8;;\x07
+# The URI in the params is the canonical full URL — it is never soft-wrapped.
+# The display text IS wrapped by the TUI column renderer; discarding it and
+# substituting the URI gives us the full unbroken URL.
+_OSC8_RE = re.compile(
+    r'\x1b\]8;[^;]*;([^\x07\x1b]*)'   # \x1b]8;params;URI — capture URI (group 1)
+    r'(?:\x07|\x1b\\)'                 # BEL or ST terminator
+    r'([^\x1b]*)'                      # capture display text (group 2)
+    r'\x1b\]8;;'                       # closing sequence (empty URI = close)
+    r'(?:\x07|\x1b\\)',                # closing terminator
+)
+
+def extract_osc8_urls(text: str) -> str:
+    """
+    Replace OSC 8 hyperlink sequences with their canonical URI from params.
+    Must run before strip_ansi so the URI isn't discarded with the sequence.
+    Falls back to display text for non-HTTP links (e.g. mailto:, custom schemes).
+    """
+    def _replace(m: re.Match) -> str:
+        uri, display = m.group(1), m.group(2)
+        if uri.startswith(('http://', 'https://', 'file://')):
+            return uri
+        return display  # non-URL link: preserve display text
+    return _OSC8_RE.sub(_replace, text)
+
+
+# ── ANSI stripping ────────────────────────────────────────────────────────────
+# OSC 8 is handled by extract_osc8_urls() before this runs; remaining OSC
+# sequences (title sets, clipboard writes, etc.) are stripped here.
+_ANSI = re.compile(
+    r'\x1b\[[0-9;]*[mGKHFABCDJsuhlr]'        # CSI  (colour, cursor, erase)
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'     # OSC  (title, clipboard, etc.)
+    r'|\x1b[()][AB012]'                        # G0/G1 charset
+    r'|\x1b[A-Za-z]'                           # simple 2-char sequences
+    r'|\r'                                     # bare carriage-return
+)
+
+def strip_ansi(text: str) -> str:
+    return _ANSI.sub('', text)
+
+
+# ── Box-padding removal ───────────────────────────────────────────────────────
+def strip_box_indent(lines: list[str]) -> list[str]:
+    """
+    TUI panels indent content by a fixed amount (commonly 2-4 spaces).
+    Delimiter/anchor lines (e.g. EOF, the command itself) are NOT indented.
+    Strategy: find the most common non-zero indent; strip it from any line
+    that carries it, leaving unindented lines untouched.
+    """
+    counts: Counter = Counter()
+    for line in lines:
+        if line.strip():
+            indent = len(line) - len(line.lstrip(' '))
+            if indent > 0:
+                counts[indent] += 1
+
+    if not counts:
+        return lines
+
+    dominant_indent, freq = counts.most_common(1)[0]
+    total_nonempty = sum(1 for l in lines if l.strip())
+
+    # Only act if this indent appears on ≥30 % of non-empty lines
+    if freq / total_nonempty < 0.30:
+        return lines
+
+    prefix = ' ' * dominant_indent
+    return [line[dominant_indent:] if line.startswith(prefix) else line
+            for line in lines]
+
+
+# ── Soft-wrap + URL-break rejoining ──────────────────────────────────────────
+_COMPLETE_LINE_RE = re.compile(r'["\')}\];]$')  # syntactically closed line
+_CONTINUATION_END_RE = re.compile(r'(?:&&|\|\||[<>\\,(\[{])\s*$')  # mid-expression
+_NEW_LINE_RE = re.compile(
+    r'^\s*$'               # blank
+    r'|^#'                 # shell/markdown comment or heading
+    r'|^\d+\.\s'           # ordered list
+    r'|^[-*+]\s'           # unordered list
+    r'|^>\s'               # blockquote
+    r'|^[A-Z][^=\[\(]*:\s*$'  # "Label:" header line
+    r'|^```'               # fenced code delimiter
+    r'|^EOF\b'             # heredoc sentinel
+)
+
+# RFC 3986 characters valid inside a URL (unreserved + reserved + percent)
+_URL_SAFE = frozenset(
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    "0123456789-._~:/?#[]@!$&'()*+,;=%"
+)
+# Characters that appear in URLs but not in normal English words — used to
+# confirm that a leading token is a URL fragment, not prose like "for" or "the"
+_URL_SPECIFIC = frozenset("0123456789/?%&=_-#~@:+;$")
+
+# Matches a URL that extends to the end of the line (i.e. the line was cut
+# mid-URL by the terminal column renderer, not followed by prose/space)
+_URL_AT_END_RE = re.compile(r'https?://\S+$')
+
+
+def _is_url_continuation(s: str) -> bool:
+    """
+    True if s starts with a URL-tail fragment:
+      - first token has no spaces (or is the whole line up to first space)
+      - does not start with an uppercase letter (would signal a new sentence)
+      - contains at least one URL-specific character (digit, %, ?, &, =, /, etc.)
+        to distinguish real URL tails from prose words like "for" or "the"
+      - all chars in first token are URL-safe
+    """
+    s = s.strip()
+    if not s or _NEW_LINE_RE.match(s):
+        return False
+    first_token = s.split(' ', 1)[0]
+    if not first_token or first_token[0].isupper():
+        return False  # uppercase start → likely a new sentence or word
+    if not any(c in _URL_SPECIFIC for c in first_token):
+        return False  # no URL-specific chars → looks like a prose word
+    return all(c in _URL_SAFE for c in first_token)
+
+
+def rejoin_wrapped(lines: list[str], width: int) -> list[str]:
+    """
+    Join a line with its successor when either:
+      A) Width threshold — original line fills (width - 2)+ columns → hit margin
+         Joins with a single space (terminal word-wrap breaks at whitespace).
+      B) Mid-URL break — line ends with a URL extending to EOL, AND the next
+         line's leading token is a URL-safe fragment containing URL-specific chars.
+         Joins without a separator (URL fragments concatenate directly).
+
+    Key: always check lines[i] (original terminal-width-capped line) for the
+    threshold test, not the growing accumulated 'line'.
+    """
+    result: list[str] = []
+    i = 0
+    threshold = width - 2
+    while i < len(lines):
+        line = lines[i]
+        while i + 1 < len(lines):
+            orig = lines[i].rstrip()
+            nxt = lines[i + 1]
+            nxt_stripped = nxt.lstrip()
+
+            if not nxt_stripped or _NEW_LINE_RE.match(nxt_stripped):
+                break
+
+            # (A) Width threshold or explicit continuation operator
+            hits_margin = (len(orig) >= threshold or
+                           _CONTINUATION_END_RE.search(orig))
+
+            # (B) Line ends mid-URL and next line starts with a URL-tail fragment.
+            # _URL_AT_END_RE ensures the URL reaches EOL (not followed by prose);
+            # _is_url_continuation ensures the next token is a real URL fragment
+            # and not a prose word like "for" or "the".
+            mid_url = (bool(orig) and
+                       bool(_URL_AT_END_RE.search(orig)) and
+                       _is_url_continuation(nxt_stripped))
+
+            if not hits_margin and not mid_url:
+                break
+
+            # URL fragments join directly; word-wrap inserts a space
+            sep = '' if mid_url else ' '
+            line = line.rstrip() + sep + nxt_stripped
+            i += 1
+
+            if _COMPLETE_LINE_RE.search(line.rstrip()):
+                break
+
+        result.append(line)
+        i += 1
+    return result
+
+
+# ── Cursor-bleed stripping ────────────────────────────────────────────────────
+def strip_cursor_bleed(lines: list[str]) -> list[str]:
+    """
+    Strip terminal block-cursor artifacts that bleed into line-starts on copy.
+    Pattern: bare | or │ at start of line, NOT followed by a space (which
+    would indicate a Markdown table row — those must be preserved).
+    """
+    result = []
+    for line in lines:
+        if line.startswith(('|', '\u2502')):
+            ch = line[1:2]
+            if ch not in (' ', '-', '=', '|', '\u2502'):
+                line = line[1:]
+        result.append(line)
+    return result
+
+
+# ── Main cleaning pipeline ────────────────────────────────────────────────────
+def clean(text: str, width: int | None = None) -> str:
+    text = extract_osc8_urls(text)   # must come before strip_ansi
+    text = strip_ansi(text)
+    lines = text.split('\n')
+    lines = strip_cursor_bleed(lines)
+    lines = strip_box_indent(lines)
+    if width is None:
+        content_lengths = [len(l.rstrip()) for l in lines if l.strip()]
+        max_len = max(content_lengths) if content_lengths else 120
+        width = max_len if max_len >= 60 else 300
+    lines = rejoin_wrapped(lines, width)
+    return '\n'.join(lines)
+
+
+# ── I/O helpers ───────────────────────────────────────────────────────────────
+def pbpaste() -> str:
+    return subprocess.check_output(['pbpaste'], text=True)
+
+def pbcopy(text: str) -> None:
+    subprocess.run(['pbcopy'], input=text, text=True, check=True)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description='Strip TUI rendering artifacts (indent, ANSI, soft-wrap, URL-wrap)')
+    p.add_argument('-', dest='stdin_mode', action='store_true',
+                   help='stdin → stdout (pipeline mode)')
+    p.add_argument('--print', dest='print_mode', action='store_true',
+                   help='clipboard in, stdout out (no clipboard write)')
+    p.add_argument('--width', '-w', type=int, default=None,
+                   help='terminal width for wrap detection (default: auto)')
+    args = p.parse_args()
+
+    stdin_mode = args.stdin_mode or not sys.stdin.isatty()
+
+    if stdin_mode:
+        result = clean(sys.stdin.read(), args.width)
+        sys.stdout.write(result)
+    elif args.print_mode:
+        result = clean(pbpaste(), args.width)
+        print(result)
+    else:
+        original = pbpaste()
+        result = clean(original, args.width)
+        pbcopy(result)
+        delta = len(original) - len(result)
+        print(f"tui-clean: {len(original)} → {len(result)} chars ({delta:+d})", file=sys.stderr)
+
+if __name__ == '__main__':
+    main()
